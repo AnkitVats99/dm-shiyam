@@ -1,0 +1,476 @@
+import Database from "better-sqlite3";
+import path from "path";
+import { v4 as uuidv4 } from "uuid";
+import type { Account, Automation, ActivityLog, DashboardStats, AnalyticsData, User } from "@/types";
+
+const DB_PATH = path.join(process.cwd(), "dmagic.db");
+
+let _db: Database.Database | null = null;
+
+function getDb(): Database.Database {
+  if (!_db) {
+    _db = new Database(DB_PATH);
+    _db.pragma("journal_mode = WAL");
+    _db.pragma("foreign_keys = ON");
+    initTables(_db);
+  }
+  return _db;
+}
+
+function initTables(db: Database.Database) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      password_hash TEXT,
+      provider TEXT NOT NULL DEFAULT 'credentials',
+      provider_id TEXT,
+      plan TEXT NOT NULL DEFAULT 'free',
+      razorpay_customer_id TEXT,
+      razorpay_subscription_id TEXT,
+      subscription_status TEXT NOT NULL DEFAULT 'none',
+      dm_limit INTEGER NOT NULL DEFAULT 100,
+      dms_used_this_month INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      instagram_account_id TEXT NOT NULL UNIQUE,
+      instagram_username TEXT NOT NULL,
+      access_token TEXT NOT NULL,
+      page_id TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS automations (
+      id TEXT PRIMARY KEY,
+      account_id TEXT,
+      name TEXT NOT NULL,
+      trigger_keywords TEXT NOT NULL,
+      dm_message TEXT NOT NULL,
+      reply_comment TEXT,
+      ai_enabled INTEGER DEFAULT 0,
+      ai_system_prompt TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      total_triggered INTEGER DEFAULT 0,
+      FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS activity_log (
+      id TEXT PRIMARY KEY,
+      account_id TEXT,
+      automation_id TEXT NOT NULL,
+      automation_name TEXT NOT NULL,
+      instagram_user_id TEXT NOT NULL,
+      instagram_username TEXT NOT NULL,
+      comment_text TEXT NOT NULL,
+      matched_keyword TEXT NOT NULL,
+      dm_sent INTEGER DEFAULT 0,
+      comment_replied INTEGER DEFAULT 0,
+      ai_generated INTEGER DEFAULT 0,
+      error_message TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+      FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_activity_automation ON activity_log(automation_id);
+    CREATE INDEX IF NOT EXISTS idx_activity_account ON activity_log(account_id);
+    CREATE INDEX IF NOT EXISTS idx_automations_account ON automations(account_id);
+  `);
+
+  // Migration: add new columns to existing tables (safe to re-run)
+  const migrations = [
+    "ALTER TABLE automations ADD COLUMN account_id TEXT",
+    "ALTER TABLE automations ADD COLUMN ai_enabled INTEGER DEFAULT 0",
+    "ALTER TABLE automations ADD COLUMN ai_system_prompt TEXT",
+    "ALTER TABLE activity_log ADD COLUMN account_id TEXT",
+    "ALTER TABLE activity_log ADD COLUMN ai_generated INTEGER DEFAULT 0",
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch { /* column already exists */ }
+  }
+}
+
+// ═══════════════════════════════════════
+// ── Accounts CRUD ──
+// ═══════════════════════════════════════
+
+export function getAllAccounts(): Account[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM accounts ORDER BY created_at DESC")
+    .all() as Account[];
+}
+
+export function getAccount(id: string): Account | undefined {
+  const db = getDb();
+  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as Account | undefined;
+}
+
+export function getAccountByInstagramId(igId: string): Account | undefined {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM accounts WHERE instagram_account_id = ?")
+    .get(igId) as Account | undefined;
+}
+
+export function createAccount(data: {
+  instagram_account_id: string;
+  instagram_username: string;
+  access_token: string;
+  page_id?: string;
+}): Account {
+  const db = getDb();
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO accounts (id, instagram_account_id, instagram_username, access_token, page_id)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(id, data.instagram_account_id, data.instagram_username, data.access_token, data.page_id || null);
+  return getAccount(id)!;
+}
+
+export function updateAccount(
+  id: string,
+  data: Partial<{ instagram_username: string; access_token: string; page_id: string; is_active: boolean }>
+): Account | undefined {
+  const db = getDb();
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  if (data.instagram_username !== undefined) { fields.push("instagram_username = ?"); values.push(data.instagram_username); }
+  if (data.access_token !== undefined) { fields.push("access_token = ?"); values.push(data.access_token); }
+  if (data.page_id !== undefined) { fields.push("page_id = ?"); values.push(data.page_id); }
+  if (data.is_active !== undefined) { fields.push("is_active = ?"); values.push(data.is_active ? 1 : 0); }
+  if (fields.length === 0) return getAccount(id);
+  fields.push("updated_at = datetime('now')");
+  values.push(id);
+  db.prepare(`UPDATE accounts SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+  return getAccount(id);
+}
+
+export function deleteAccount(id: string): boolean {
+  const db = getDb();
+  return db.prepare("DELETE FROM accounts WHERE id = ?").run(id).changes > 0;
+}
+
+// ═══════════════════════════════════════
+// ── Automations CRUD ──
+// ═══════════════════════════════════════
+
+export function getAllAutomations(accountId?: string): Automation[] {
+  const db = getDb();
+  if (accountId) {
+    return db
+      .prepare("SELECT * FROM automations WHERE account_id = ? ORDER BY created_at DESC")
+      .all(accountId) as Automation[];
+  }
+  return db
+    .prepare("SELECT * FROM automations ORDER BY created_at DESC")
+    .all() as Automation[];
+}
+
+export function getAutomation(id: string): Automation | undefined {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM automations WHERE id = ?")
+    .get(id) as Automation | undefined;
+}
+
+export function getActiveAutomations(accountId?: string): Automation[] {
+  const db = getDb();
+  if (accountId) {
+    return db
+      .prepare("SELECT * FROM automations WHERE is_active = 1 AND account_id = ?")
+      .all(accountId) as Automation[];
+  }
+  return db
+    .prepare("SELECT * FROM automations WHERE is_active = 1")
+    .all() as Automation[];
+}
+
+export function createAutomation(data: {
+  name: string;
+  trigger_keywords: string;
+  dm_message: string;
+  reply_comment?: string;
+  account_id?: string;
+  ai_enabled?: boolean;
+  ai_system_prompt?: string;
+}): Automation {
+  const db = getDb();
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO automations (id, account_id, name, trigger_keywords, dm_message, reply_comment, ai_enabled, ai_system_prompt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    data.account_id || null,
+    data.name,
+    data.trigger_keywords.toLowerCase(),
+    data.dm_message,
+    data.reply_comment || null,
+    data.ai_enabled ? 1 : 0,
+    data.ai_system_prompt || null
+  );
+  return getAutomation(id)!;
+}
+
+export function updateAutomation(
+  id: string,
+  data: Partial<{
+    name: string;
+    trigger_keywords: string;
+    dm_message: string;
+    reply_comment: string;
+    is_active: boolean;
+    account_id: string;
+    ai_enabled: boolean;
+    ai_system_prompt: string;
+  }>
+): Automation | undefined {
+  const db = getDb();
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (data.name !== undefined) { fields.push("name = ?"); values.push(data.name); }
+  if (data.trigger_keywords !== undefined) { fields.push("trigger_keywords = ?"); values.push(data.trigger_keywords.toLowerCase()); }
+  if (data.dm_message !== undefined) { fields.push("dm_message = ?"); values.push(data.dm_message); }
+  if (data.reply_comment !== undefined) { fields.push("reply_comment = ?"); values.push(data.reply_comment); }
+  if (data.is_active !== undefined) { fields.push("is_active = ?"); values.push(data.is_active ? 1 : 0); }
+  if (data.account_id !== undefined) { fields.push("account_id = ?"); values.push(data.account_id || null); }
+  if (data.ai_enabled !== undefined) { fields.push("ai_enabled = ?"); values.push(data.ai_enabled ? 1 : 0); }
+  if (data.ai_system_prompt !== undefined) { fields.push("ai_system_prompt = ?"); values.push(data.ai_system_prompt); }
+
+  if (fields.length === 0) return getAutomation(id);
+
+  fields.push("updated_at = datetime('now')");
+  values.push(id);
+
+  db.prepare(`UPDATE automations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+  return getAutomation(id);
+}
+
+export function deleteAutomation(id: string): boolean {
+  const db = getDb();
+  return db.prepare("DELETE FROM automations WHERE id = ?").run(id).changes > 0;
+}
+
+export function incrementTriggerCount(id: string): void {
+  const db = getDb();
+  db.prepare("UPDATE automations SET total_triggered = total_triggered + 1 WHERE id = ?").run(id);
+}
+
+// ═══════════════════════════════════════
+// ── Activity Log ──
+// ═══════════════════════════════════════
+
+export function logActivity(data: {
+  account_id?: string;
+  automation_id: string;
+  automation_name: string;
+  instagram_user_id: string;
+  instagram_username: string;
+  comment_text: string;
+  matched_keyword: string;
+  dm_sent: boolean;
+  comment_replied: boolean;
+  ai_generated?: boolean;
+  error_message?: string;
+}): ActivityLog {
+  const db = getDb();
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO activity_log 
+     (id, account_id, automation_id, automation_name, instagram_user_id, instagram_username, 
+      comment_text, matched_keyword, dm_sent, comment_replied, ai_generated, error_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    data.account_id || null,
+    data.automation_id,
+    data.automation_name,
+    data.instagram_user_id,
+    data.instagram_username,
+    data.comment_text,
+    data.matched_keyword,
+    data.dm_sent ? 1 : 0,
+    data.comment_replied ? 1 : 0,
+    data.ai_generated ? 1 : 0,
+    data.error_message || null
+  );
+  return db.prepare("SELECT * FROM activity_log WHERE id = ?").get(id) as ActivityLog;
+}
+
+export function getActivityLog(limit = 50, offset = 0, accountId?: string): ActivityLog[] {
+  const db = getDb();
+  if (accountId) {
+    return db
+      .prepare("SELECT * FROM activity_log WHERE account_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(accountId, limit, offset) as ActivityLog[];
+  }
+  return db
+    .prepare("SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ? OFFSET ?")
+    .all(limit, offset) as ActivityLog[];
+}
+
+// ═══════════════════════════════════════
+// ── Dashboard Stats ──
+// ═══════════════════════════════════════
+
+export function getDashboardStats(): DashboardStats {
+  const db = getDb();
+  const q = (sql: string) => (db.prepare(sql).get() as { count: number }).count;
+
+  return {
+    total_automations: q("SELECT COUNT(*) as count FROM automations"),
+    active_automations: q("SELECT COUNT(*) as count FROM automations WHERE is_active = 1"),
+    total_dms_sent: q("SELECT COUNT(*) as count FROM activity_log WHERE dm_sent = 1"),
+    total_comments_replied: q("SELECT COUNT(*) as count FROM activity_log WHERE comment_replied = 1"),
+    dms_today: q("SELECT COUNT(*) as count FROM activity_log WHERE dm_sent = 1 AND date(created_at) = date('now')"),
+    dms_this_week: q("SELECT COUNT(*) as count FROM activity_log WHERE dm_sent = 1 AND created_at >= datetime('now', '-7 days')"),
+    ai_replies: q("SELECT COUNT(*) as count FROM activity_log WHERE ai_generated = 1"),
+    accounts_connected: q("SELECT COUNT(*) as count FROM accounts WHERE is_active = 1"),
+  };
+}
+
+// ═══════════════════════════════════════
+// ── Analytics ──
+// ═══════════════════════════════════════
+
+export function getAnalyticsData(days = 30): AnalyticsData {
+  const db = getDb();
+
+  // DMs over time (last N days)
+  const dmsOverTime = db.prepare(`
+    SELECT date(created_at) as date,
+           COUNT(*) as count,
+           SUM(CASE WHEN ai_generated = 1 THEN 1 ELSE 0 END) as ai_count
+    FROM activity_log
+    WHERE dm_sent = 1 AND created_at >= datetime('now', '-${days} days')
+    GROUP BY date(created_at)
+    ORDER BY date ASC
+  `).all() as Array<{ date: string; count: number; ai_count: number }>;
+
+  // Top keywords
+  const topKeywords = db.prepare(`
+    SELECT matched_keyword as keyword, COUNT(*) as count
+    FROM activity_log
+    WHERE created_at >= datetime('now', '-${days} days')
+    GROUP BY matched_keyword
+    ORDER BY count DESC
+    LIMIT 10
+  `).all() as Array<{ keyword: string; count: number }>;
+
+  // Hourly distribution
+  const hourlyDist = db.prepare(`
+    SELECT CAST(strftime('%H', created_at) AS INTEGER) as hour, COUNT(*) as count
+    FROM activity_log
+    WHERE dm_sent = 1 AND created_at >= datetime('now', '-${days} days')
+    GROUP BY hour
+    ORDER BY hour ASC
+  `).all() as Array<{ hour: number; count: number }>;
+
+  // Fill missing hours with 0
+  const hourlyMap = new Map(hourlyDist.map((h) => [h.hour, h.count]));
+  const hourlyDistribution = Array.from({ length: 24 }, (_, i) => ({
+    hour: i,
+    count: hourlyMap.get(i) || 0,
+  }));
+
+  // Success rate
+  const sent = (db.prepare(
+    `SELECT COUNT(*) as count FROM activity_log WHERE dm_sent = 1 AND created_at >= datetime('now', '-${days} days')`
+  ).get() as { count: number }).count;
+  const failed = (db.prepare(
+    `SELECT COUNT(*) as count FROM activity_log WHERE dm_sent = 0 AND created_at >= datetime('now', '-${days} days')`
+  ).get() as { count: number }).count;
+
+  // Per-account breakdown
+  const perAccount = db.prepare(`
+    SELECT a.account_id, COALESCE(acc.instagram_username, 'Default') as username, COUNT(*) as count
+    FROM activity_log a
+    LEFT JOIN accounts acc ON a.account_id = acc.id
+    WHERE a.dm_sent = 1 AND a.created_at >= datetime('now', '-${days} days')
+    GROUP BY a.account_id
+    ORDER BY count DESC
+  `).all() as Array<{ account_id: string; username: string; count: number }>;
+
+  return {
+    dms_over_time: dmsOverTime,
+    top_keywords: topKeywords,
+    hourly_distribution: hourlyDistribution,
+    success_rate: { sent, failed },
+    per_account: perAccount,
+  };
+}
+
+// ═══════════════════════════════════════
+// ── Users ──
+// ═══════════════════════════════════════
+
+export function getUserByEmail(email: string): User | undefined {
+  const db = getDb();
+  return db.prepare("SELECT * FROM users WHERE email = ?").get(email) as User | undefined;
+}
+
+export function getUserById(id: string): User | undefined {
+  const db = getDb();
+  return db.prepare("SELECT * FROM users WHERE id = ?").get(id) as User | undefined;
+}
+
+export function getUserByProviderId(providerId: string): User | undefined {
+  const db = getDb();
+  return db.prepare("SELECT * FROM users WHERE provider_id = ?").get(providerId) as User | undefined;
+}
+
+export function createUser(data: {
+  email: string;
+  name: string;
+  password_hash?: string;
+  provider: "credentials" | "google";
+  provider_id?: string;
+}): User {
+  const db = getDb();
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO users (id, email, name, password_hash, provider, provider_id)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(id, data.email, data.name, data.password_hash || null, data.provider, data.provider_id || null);
+  return getUserById(id)!;
+}
+
+export function updateUserPlan(
+  userId: string,
+  data: {
+    plan: string;
+    dm_limit: number;
+    razorpay_customer_id?: string;
+    razorpay_subscription_id?: string;
+    subscription_status: string;
+  }
+): User | undefined {
+  const db = getDb();
+  db.prepare(
+    `UPDATE users SET plan = ?, dm_limit = ?, razorpay_customer_id = ?, razorpay_subscription_id = ?, 
+     subscription_status = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(data.plan, data.dm_limit, data.razorpay_customer_id || null, data.razorpay_subscription_id || null, data.subscription_status, userId);
+  return getUserById(userId);
+}
+
+export function incrementDmsUsed(userId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE users SET dms_used_this_month = dms_used_this_month + 1 WHERE id = ?").run(userId);
+}
+
+export function resetMonthlyDmUsage(): void {
+  const db = getDb();
+  db.prepare("UPDATE users SET dms_used_this_month = 0").run();
+}

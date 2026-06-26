@@ -1,0 +1,23 @@
+import type { Metadata } from "next";
+import Providers from "@/components/Providers";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "DMagic — Instagram Comment-to-DM Bot",
+  description:
+    "Automatically send DMs when users comment specific keywords on your Instagram posts.",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <body className="min-h-screen" suppressHydrationWarning>
+        <Providers>{children}</Providers>
+      </body>
+    </html>
+  );
+}
