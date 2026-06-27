@@ -94,6 +94,8 @@ function initTables(db: Database.Database) {
     "ALTER TABLE automations ADD COLUMN ai_system_prompt TEXT",
     "ALTER TABLE activity_log ADD COLUMN account_id TEXT",
     "ALTER TABLE activity_log ADD COLUMN ai_generated INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN reset_token TEXT",
+"ALTER TABLE users ADD COLUMN reset_token_expires TEXT",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
@@ -473,4 +475,33 @@ export function incrementDmsUsed(userId: string): void {
 export function resetMonthlyDmUsage(): void {
   const db = getDb();
   db.prepare("UPDATE users SET dms_used_this_month = 0").run();
+}
+
+export function setResetToken(email: string, token: string, expiresAt: string): boolean {
+  const db = getDb();
+  const result = db.prepare(
+    "UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE email = ?"
+  ).run(token, expiresAt, email);
+  return result.changes > 0;
+}
+
+export function getUserByResetToken(token: string): User | undefined {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM users WHERE reset_token = ? AND reset_token_expires > datetime('now')"
+  ).get(token) as User | undefined;
+}
+
+export function clearResetToken(userId: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE users SET reset_token = NULL, reset_token_expires = NULL WHERE id = ?"
+  ).run(userId);
+}
+
+export function updatePassword(userId: string, passwordHash: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(passwordHash, userId);
 }
